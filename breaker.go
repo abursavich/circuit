@@ -9,15 +9,22 @@ package circuit
 
 import (
 	"fmt"
+	"hash/maphash"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/go-logr/logr"
+	"golang.org/x/exp/constraints"
 )
 
 // Default values.
 const (
 	DefaultWindow       = 10 * time.Second
 	DefaultCooldown     = 5 * time.Second
+	DefaultSpacing      = 2 * time.Second
+	DefaultJitterFactor = 0.25
+	DefaultMinSuccess   = 3
 	DefaultMinResults   = 5
 	DefaultFailureRatio = 0.5
 )
@@ -33,11 +40,55 @@ const (
 	Open                  // Open disallows all operations.
 )
 
+// An Observer observes changes to circuit breakers.
+type Observer interface {
+	// Init is called when tha named circuit breaker is created.
+	Init(name string)
+	// ObserverStateChange is a called in a critical section
+	// when the state of the named circuit breaker changes.
+	ObserveStateChange(name string, state State)
+}
+
+// A NotifyFunc is a function that is called in a critical section
+// when the state of a circuit breaker changes.
+type NotifyFunc func(state State)
+
+type notifyFunc func(state State)
+
+func (fn notifyFunc) Init(name string)                            {}
+func (fn notifyFunc) ObserveStateChange(name string, state State) { fn(state) }
+
 // An Option provides an override to defaults.
 type Option func(*Breaker) error
 
-// WithWindow returns an Option that sets the Closed window.
-// The default is 5s.
+// WithLogger returns an Option that specifies the logger.
+func WithLogger(log logr.Logger) Option {
+	return func(b *Breaker) error {
+		b.log = log
+		return nil
+	}
+}
+
+// WithObserver returns an Option that adds an Observer.
+func WithObserver(observer Observer) Option {
+	return func(b *Breaker) error {
+		b.observers = append(b.observers, observer)
+		return nil
+	}
+}
+
+// WithNotifyFunc returns an Option that adds a function to be called
+// in a critical section when the State of the circuit breaker changes.
+func WithNotifyFunc(notify NotifyFunc) Option {
+	return func(b *Breaker) error {
+		b.observers = append(b.observers, notifyFunc(notify))
+		return nil
+	}
+}
+
+// WithWindow returns an Option that sets the window of time after
+// which results are reset when the circuit breaker is Closed.
+// The default is 10s.
 func WithWindow(window time.Duration) Option {
 	return func(b *Breaker) error {
 		if window <= 0 {
@@ -48,20 +99,8 @@ func WithWindow(window time.Duration) Option {
 	}
 }
 
-// WithCooldown returns an Option that sets the Open cooldown.
-// The default is 10s.
-func WithCooldown(cooldown time.Duration) Option {
-	return func(b *Breaker) error {
-		if cooldown <= 0 {
-			return fmt.Errorf("invalid cooldown: %v", cooldown)
-		}
-		b.cooldown = cooldown
-		return nil
-	}
-}
-
 // WithMinResults returns an Option that sets the minimum number of results
-// required in a Closed window before the circuit breaker may be Opened.
+// in a window required to switch the circuit breaker from Closed to Open.
 // The default is 5.
 func WithMinResults(min int) Option {
 	return func(b *Breaker) error {
@@ -74,7 +113,7 @@ func WithMinResults(min int) Option {
 }
 
 // WithFailureRatio returns an Option that sets the minimum failure ratio
-// required in a Closed window before the circuit breaker may be Opened.
+// in a window required to switch the circuit breaker from Closed to Open.
 // The default is 50%.
 func WithFailureRatio(ratio float64) Option {
 	return func(b *Breaker) error {
@@ -86,11 +125,54 @@ func WithFailureRatio(ratio float64) Option {
 	}
 }
 
-// WithNotifyFunc returns an Option that specifies a function to be called
-// in a critical section when the State of the circuit breaker changes.
-func WithNotifyFunc(notify func(State)) Option {
+// WithCooldown returns an Option that sets the cooldown time before
+// probes will be allowed when the circuit breaker is Open.
+// The default is 5s.
+func WithCooldown(cooldown time.Duration) Option {
 	return func(b *Breaker) error {
-		b.notifyFns = append(b.notifyFns, notify)
+		if cooldown <= 0 {
+			return fmt.Errorf("invalid cooldown: %v", cooldown)
+		}
+		b.cooldown = cooldown
+		return nil
+	}
+}
+
+// WithSpacing returns an Option that sets the spacing time between
+// allowed probes when the circuit breaker is HalfOpen.
+// The default is 2s.
+func WithSpacing(spacing time.Duration) Option {
+	return func(b *Breaker) error {
+		if spacing <= 0 {
+			return fmt.Errorf("invalid spacing: %v", spacing)
+		}
+		b.spacing = spacing
+		return nil
+	}
+}
+
+// WithJitterFactor returns an Option that sets the random
+// jitter factor applied to cooldown and spacing delays.
+// The default is 25%.
+func WithJitterFactor(jitter float64) Option {
+	return func(b *Breaker) error {
+		if jitter < 0 {
+			return fmt.Errorf("invalid jitter: %v", jitter)
+		}
+		b.jitter = jitter
+		return nil
+	}
+}
+
+// WithMinSuccess returns an Option that sets the minimum number of consecutive
+// successful probes required to switch the circuit breaker from HalfOpen to Closed.
+// The default is 3.
+func WithMinSuccess(min int) Option {
+	return func(b *Breaker) error {
+		if min <= 0 {
+			return fmt.Errorf("invalid minimum success: %v", min)
+		}
+		b.minSuccess = min
 		return nil
 	}
 }
@@ -107,9 +189,15 @@ func WithFilter(filter func(error) error) Option {
 
 // A Breaker is a circuit breaker.
 type Breaker struct {
+	log  logr.Logger
+	name string
+
 	window     time.Duration
 	cooldown   time.Duration
+	spacing    time.Duration
+	jitter     float64
 	minResults int
+	minSuccess int
 	failRatio  float64
 	filter     func(error) error
 
@@ -118,17 +206,22 @@ type Breaker struct {
 	deadline  atomic.Pointer[time.Time]
 	success   atomic.Int64
 	failure   atomic.Int64
-	notifyFns []func(State)
+	observers []Observer
 
 	timeNow func() time.Time
 }
 
-// NewBreaker returns a circuit breaker with the given options.
-func NewBreaker(options ...Option) (*Breaker, error) {
+// NewBreaker returns a named circuit breaker with the given options.
+func NewBreaker(name string, options ...Option) (*Breaker, error) {
 	b := &Breaker{
+		log:        logr.Discard(),
+		name:       name,
 		window:     DefaultWindow,
 		cooldown:   DefaultCooldown,
+		spacing:    DefaultSpacing,
+		jitter:     DefaultJitterFactor,
 		minResults: DefaultMinResults,
+		minSuccess: DefaultMinSuccess,
 		failRatio:  DefaultFailureRatio,
 		timeNow:    time.Now,
 	}
@@ -136,6 +229,9 @@ func NewBreaker(options ...Option) (*Breaker, error) {
 		if err := fn(b); err != nil {
 			return nil, err
 		}
+	}
+	for _, o := range b.observers {
+		o.Init(name)
 	}
 	window := b.timeNow().Add(b.window)
 	b.deadline.Store(&window)
@@ -146,36 +242,28 @@ func NewBreaker(options ...Option) (*Breaker, error) {
 func (b *Breaker) State() State { return State(b.state.Load()) }
 
 func (b *Breaker) lockedStoreState(state State) {
+	b.log.Info("Circuit breaker state changed", "name", b.name, "state", state)
 	b.state.Store(int64(state))
-	for _, notify := range b.notifyFns {
-		notify(state)
+	for _, o := range b.observers {
+		o.ObserveStateChange(b.name, state)
 	}
 }
 
 // AddNotifyFunc adds the notify function to be called in a critical section
 // when the State of the circuit breaker changes.
-func (b *Breaker) AddNotifyFunc(notify func(State)) {
+func (b *Breaker) AddNotifyFunc(notify NotifyFunc) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	b.notifyFns = append(b.notifyFns, notify)
+	b.observers = append(b.observers, notifyFunc(notify))
 }
 
 // Allow returns a value indicating if an operation is allowed.
 // If the operation is allowed, its result MUST be recorded.
 func (b *Breaker) Allow() bool {
-	switch State(b.state.Load()) {
-	case Closed:
+	if b.State() == Closed {
 		return true
-	case HalfOpen:
-		// Allowing an occasional probe here can prevent the breaker
-		// from being stuck in a bad state due to misbehaving callers
-		// that fail to report the result of the original probe.
-		return b.shouldProbe()
-	case Open:
-		return b.shouldProbe()
-	default:
-		panic("invalid state")
 	}
+	return b.shouldProbe()
 }
 
 func (b *Breaker) shouldProbe() bool {
@@ -184,13 +272,22 @@ func (b *Breaker) shouldProbe() bool {
 	if !deadline.Before(now) {
 		return false
 	}
+
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	cooldown := now.Add(b.cooldown)
-	if !b.deadline.CompareAndSwap(deadline, &cooldown) {
+
+	delay := b.spacing
+	state := b.State()
+	if state == Open {
+		delay = b.cooldown
+	}
+	then := now.Add(jitter(delay, b.jitter))
+	if !b.deadline.CompareAndSwap(deadline, &then) {
 		return false
 	}
-	if b.State() == Open {
+	if state == Open {
+		b.failure.Store(0)
+		b.success.Store(0)
 		b.lockedStoreState(HalfOpen)
 	}
 	return true
@@ -202,12 +299,12 @@ func (b *Breaker) Record(err error) {
 		err = b.filter(err)
 	}
 	switch b.State() {
-	case Open:
-		// TODO: Close on latent success?
 	case Closed:
 		b.recordClosed(err)
 	case HalfOpen:
 		b.recordHalfOpen(err)
+	case Open:
+		// TODO: Record latent success?
 	}
 }
 
@@ -219,12 +316,10 @@ func (b *Breaker) recordHalfOpen(err error) {
 	}
 	defer b.mu.Unlock()
 
-	now := b.timeNow()
-
 	// Reopen
 	if err != nil {
-		cooldown := b.deadline.Load().Add(b.cooldown)
-		if cooldown.Before(now) {
+		cooldown := b.deadline.Load().Add(jitter(b.cooldown, b.jitter))
+		if now := b.timeNow(); cooldown.Before(now) {
 			cooldown = now
 		}
 		b.deadline.Store(&cooldown)
@@ -232,8 +327,13 @@ func (b *Breaker) recordHalfOpen(err error) {
 		return
 	}
 
+	// Stay HalfOpen
+	if b.success.Add(1) < int64(b.minSuccess) {
+		return
+	}
+
 	// Close
-	window := now.Add(b.window)
+	window := b.timeNow().Add(b.window)
 	b.deadline.Store(&window)
 	b.failure.Store(0)
 	b.success.Store(0)
@@ -282,7 +382,24 @@ func (b *Breaker) recordClosed(err error) {
 	if b.State() != Closed {
 		return
 	}
-	cooldown := now.Add(b.cooldown)
+	cooldown := now.Add(jitter(b.cooldown, b.jitter))
 	b.deadline.Store(&cooldown)
 	b.lockedStoreState(Open)
+}
+
+type real interface {
+	constraints.Integer | constraints.Float
+}
+
+func jitter[T real](v T, factor float64) T {
+	return T(float64(v) * (1 + (factor * (2*fastrand() - 1))))
+}
+
+func fastrand() float64 {
+	const (
+		mask = 1<<53 - 1
+		mult = 0x1.0p-53
+	)
+	u64 := maphash.Bytes(maphash.MakeSeed(), nil)
+	return float64(u64&mask) * mult
 }

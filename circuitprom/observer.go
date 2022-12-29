@@ -8,40 +8,49 @@
 package circuitprom
 
 import (
-	"sync/atomic"
-
 	"bursavich.dev/circuit"
 	"github.com/prometheus/client_golang/prometheus"
 )
 
-// An Observer is a Prometheus collector for a named circuit breaker.
-type Observer struct {
-	desc  *prometheus.Desc
-	state atomic.Int64
+// An Observer is a Prometheus collector for circuit breakers.
+type Observer interface {
+	circuit.Observer
+	prometheus.Collector
 }
 
-// NewObserver returns an observer for the named circuit breaker.
-func NewObserver(name string) *Observer {
-	const (
-		fqName = "circuit_breaker_closed"
-		help   = "Describes whether the named circuit breaker is currently closed"
-	)
-	return &Observer{
-		desc: prometheus.NewDesc(fqName, help, nil, prometheus.Labels{"name": name}),
+type observer struct {
+	closed *prometheus.GaugeVec
+}
+
+// NewObserver returns an observer for circuit breakers.
+func NewObserver() Observer {
+	return &observer{
+		closed: prometheus.NewGaugeVec(
+			prometheus.GaugeOpts{
+				Name: "circuit_breaker_closed",
+				Help: "Describes whether the named circuit breaker is currently closed",
+			},
+			[]string{"name"},
+		),
 	}
 }
 
-func (o *Observer) ObserveStateChange(state circuit.State) { o.state.Store(int64(state)) }
-
-func (o *Observer) Describe(ch chan<- *prometheus.Desc) { ch <- o.desc }
-
-func (o *Observer) Collect(ch chan<- prometheus.Metric) {
-	ch <- prometheus.MustNewConstMetric(o.desc, prometheus.GaugeValue, o.closedValue())
+func (o *observer) Collect(ch chan<- prometheus.Metric) {
+	o.closed.Collect(ch)
 }
 
-func (o *Observer) closedValue() float64 {
-	if o.state.Load() == int64(circuit.Closed) {
-		return 1
+func (o *observer) Describe(ch chan<- *prometheus.Desc) {
+	o.closed.Describe(ch)
+}
+
+func (o *observer) Init(name string) {
+	o.closed.WithLabelValues(name).Set(1)
+}
+
+func (o *observer) ObserveStateChange(name string, state circuit.State) {
+	v := 1.0
+	if state != circuit.Closed {
+		v = 0
 	}
-	return 0
+	o.closed.WithLabelValues(name).Set(v)
 }
