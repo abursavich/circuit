@@ -60,7 +60,7 @@ type observer struct {
 }
 
 // NewObserver returns an observer for a circuit breaker with the given options.
-func NewObserver(name string, options ...Option) Observer {
+func NewObserver(options ...Option) Observer {
 	var cfg config
 	for _, o := range options {
 		o.apply(&cfg)
