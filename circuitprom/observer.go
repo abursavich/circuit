@@ -76,7 +76,10 @@ func NewObserver(options ...Option) Observer {
 }
 
 func (o *observer) Collect(ch chan<- prometheus.Metric) {
-	ch <- prometheus.MustNewConstMetric(o.desc, prometheus.GaugeValue, 1, circuit.State(o.state.Load()).String())
+	state := circuit.State(o.state.Load())
+	ch <- prometheus.MustNewConstMetric(o.desc, prometheus.GaugeValue, eq(state, circuit.Closed), circuit.Closed.String())
+	ch <- prometheus.MustNewConstMetric(o.desc, prometheus.GaugeValue, eq(state, circuit.HalfOpen), circuit.HalfOpen.String())
+	ch <- prometheus.MustNewConstMetric(o.desc, prometheus.GaugeValue, eq(state, circuit.Open), circuit.Open.String())
 }
 
 func (o *observer) Describe(ch chan<- *prometheus.Desc) {
@@ -85,4 +88,11 @@ func (o *observer) Describe(ch chan<- *prometheus.Desc) {
 
 func (o *observer) ObserveStateChange(state circuit.State) {
 	o.state.Store(int32(state))
+}
+
+func eq[T comparable](a, b T) float64 {
+	if a == b {
+		return 1
+	}
+	return 0
 }
