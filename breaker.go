@@ -41,11 +41,9 @@ const (
 
 // An Observer observes changes to circuit breakers.
 type Observer interface {
-	// Init is called when tha named circuit breaker is created.
-	Init(name string)
 	// ObserverStateChange is a called in a critical section
-	// when the state of the named circuit breaker changes.
-	ObserveStateChange(name string, state State)
+	// when the state of the circuit breaker changes.
+	ObserveStateChange(state State)
 }
 
 // A NotifyFunc is a function that is called in a critical section
@@ -54,8 +52,7 @@ type NotifyFunc func(state State)
 
 type notifyFunc func(state State)
 
-func (fn notifyFunc) Init(name string)                            {}
-func (fn notifyFunc) ObserveStateChange(name string, state State) { fn(state) }
+func (fn notifyFunc) ObserveStateChange(state State) { fn(state) }
 
 // An Option provides an override to defaults.
 type Option func(*Breaker) error
@@ -188,8 +185,7 @@ func WithFilter(filter func(error) error) Option {
 
 // A Breaker is a circuit breaker.
 type Breaker struct {
-	log  logr.Logger
-	name string
+	log logr.Logger
 
 	window     time.Duration
 	cooldown   time.Duration
@@ -210,11 +206,10 @@ type Breaker struct {
 	timeNow func() time.Time
 }
 
-// NewBreaker returns a named circuit breaker with the given options.
-func NewBreaker(name string, options ...Option) (*Breaker, error) {
+// NewBreaker returns a circuit breaker with the given options.
+func NewBreaker(options ...Option) (*Breaker, error) {
 	b := &Breaker{
 		log:        logr.Discard(),
-		name:       name,
 		window:     DefaultWindow,
 		cooldown:   DefaultCooldown,
 		spacing:    DefaultSpacing,
@@ -229,9 +224,6 @@ func NewBreaker(name string, options ...Option) (*Breaker, error) {
 			return nil, err
 		}
 	}
-	for _, o := range b.observers {
-		o.Init(name)
-	}
 	window := b.timeNow().Add(b.window)
 	b.deadline.Store(&window)
 	return b, nil
@@ -241,10 +233,10 @@ func NewBreaker(name string, options ...Option) (*Breaker, error) {
 func (b *Breaker) State() State { return State(b.state.Load()) }
 
 func (b *Breaker) lockedStoreState(state State) {
-	b.log.Info("Circuit breaker state changed", "name", b.name, "state", state)
+	b.log.Info("Circuit breaker state changed", "state", state)
 	b.state.Store(int64(state))
 	for _, o := range b.observers {
-		o.ObserveStateChange(b.name, state)
+		o.ObserveStateChange(state)
 	}
 }
 

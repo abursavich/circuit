@@ -8,49 +8,81 @@
 package circuitprom
 
 import (
+	"sync/atomic"
+
 	"bursavich.dev/circuit"
 	"github.com/prometheus/client_golang/prometheus"
 )
 
-// An Observer is a Prometheus collector for circuit breakers.
+// An Option provides optional configuration for an Observer.
+type Option interface {
+	apply(*config)
+}
+
+type optionFunc func(*config)
+
+func (fn optionFunc) apply(c *config) { fn(c) }
+
+type config struct {
+	namespace   string
+	constLabels prometheus.Labels
+}
+
+// WithNamespace returns an Option that sets the namespace for all metrics.
+// The default is empty.
+func WithNamespace(namespace string) Option {
+	return optionFunc(func(c *config) {
+		c.namespace = namespace
+	})
+}
+
+// WithConstLabels returns an Option that adds constant labels to all metrics.
+func WithConstLabels(labels prometheus.Labels) Option {
+	return optionFunc(func(c *config) {
+		if c.constLabels == nil && len(labels) > 0 {
+			c.constLabels = make(prometheus.Labels, len(labels))
+		}
+		for k, v := range labels {
+			c.constLabels[k] = v
+		}
+	})
+}
+
+// An Observer is a Prometheus collector for a circuit breaker.
 type Observer interface {
 	circuit.Observer
 	prometheus.Collector
 }
 
 type observer struct {
-	closed *prometheus.GaugeVec
+	state atomic.Int32
+	desc  *prometheus.Desc
 }
 
-// NewObserver returns an observer for circuit breakers.
-func NewObserver() Observer {
+// NewObserver returns an observer for a circuit breaker with the given options.
+func NewObserver(name string, options ...Option) Observer {
+	var cfg config
+	for _, o := range options {
+		o.apply(&cfg)
+	}
 	return &observer{
-		closed: prometheus.NewGaugeVec(
-			prometheus.GaugeOpts{
-				Name: "circuit_breaker_closed",
-				Help: "Describes whether the named circuit breaker is currently closed",
-			},
-			[]string{"name"},
+		desc: prometheus.NewDesc(
+			prometheus.BuildFQName(cfg.namespace, "circuit_breaker", "status"),
+			`Describes the current status of the circuit breaker ("Closed", "HalfOpen", or "Open")`,
+			[]string{"status"},
+			cfg.constLabels,
 		),
 	}
 }
 
 func (o *observer) Collect(ch chan<- prometheus.Metric) {
-	o.closed.Collect(ch)
+	ch <- prometheus.MustNewConstMetric(o.desc, prometheus.GaugeValue, 1, circuit.State(o.state.Load()).String())
 }
 
 func (o *observer) Describe(ch chan<- *prometheus.Desc) {
-	o.closed.Describe(ch)
+	ch <- o.desc
 }
 
-func (o *observer) Init(name string) {
-	o.closed.WithLabelValues(name).Set(1)
-}
-
-func (o *observer) ObserveStateChange(name string, state circuit.State) {
-	v := 1.0
-	if state != circuit.Closed {
-		v = 0
-	}
-	o.closed.WithLabelValues(name).Set(v)
+func (o *observer) ObserveStateChange(state circuit.State) {
+	o.state.Store(int32(state))
 }
