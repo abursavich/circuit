@@ -9,13 +9,12 @@ package circuit
 
 import (
 	"fmt"
-	"hash/maphash"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"bursavich.dev/fastrand"
 	"github.com/go-logr/logr"
-	"golang.org/x/exp/constraints"
 )
 
 // Default values.
@@ -281,7 +280,7 @@ func (b *Breaker) shouldProbe() bool {
 	if state == Open {
 		delay = b.cooldown
 	}
-	then := now.Add(jitter(delay, b.jitter))
+	then := now.Add(fastrand.Jitter(delay, b.jitter))
 	if !b.deadline.CompareAndSwap(deadline, &then) {
 		return false
 	}
@@ -318,7 +317,7 @@ func (b *Breaker) recordHalfOpen(err error) {
 
 	// Reopen
 	if err != nil {
-		cooldown := b.deadline.Load().Add(jitter(b.cooldown, b.jitter))
+		cooldown := b.deadline.Load().Add(fastrand.Jitter(b.cooldown, b.jitter))
 		if now := b.timeNow(); cooldown.Before(now) {
 			cooldown = now
 		}
@@ -382,24 +381,7 @@ func (b *Breaker) recordClosed(err error) {
 	if b.State() != Closed {
 		return
 	}
-	cooldown := now.Add(jitter(b.cooldown, b.jitter))
+	cooldown := now.Add(fastrand.Jitter(b.cooldown, b.jitter))
 	b.deadline.Store(&cooldown)
 	b.lockedStoreState(Open)
-}
-
-type real interface {
-	constraints.Integer | constraints.Float
-}
-
-func jitter[T real](v T, factor float64) T {
-	return T(float64(v) * (1 + (factor * (2*fastrand() - 1))))
-}
-
-func fastrand() float64 {
-	const (
-		mask = 1<<53 - 1
-		mult = 0x1.0p-53
-	)
-	u64 := maphash.Bytes(maphash.MakeSeed(), nil)
-	return float64(u64&mask) * mult
 }
