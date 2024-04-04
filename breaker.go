@@ -304,6 +304,7 @@ func (b *Breaker) recordHalfOpen(err error) {
 	if b.State() != HalfOpen {
 		b.mu.Unlock()
 		b.Record(err)
+		return
 	}
 	defer b.mu.Unlock()
 
